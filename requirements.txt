@@ -1,0 +1,2 @@
+# The benchmark scripts use only the Python standard library (urllib, json).
+# No third-party dependencies required.
