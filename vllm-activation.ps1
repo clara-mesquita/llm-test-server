@@ -21,8 +21,8 @@ $Models = [ordered]@{
     qwen3   = @{ hf = 'Qwen/Qwen3-8B-Instruct';            port = 8002; container = 'vllm-qwen3' }
 }
 
-function Wsl($cmd) {
-    wsl -e bash -lc $cmd
+function Invoke-Wsl($cmd) {
+    wsl -e bash -lc $cmd  # named Invoke-Wsl so it doesn't shadow the wsl.exe command (self-recursion -> CallDepthOverflow)
     if ($LASTEXITCODE -ne 0) { throw "wsl command failed: $cmd" }
 }
 
@@ -41,7 +41,7 @@ function Start-Model($spec) {
            "docker run -d --name $($spec.container) --gpus all -p $($spec.port):8000 " +
            "--ipc=host --shm-size=8gb -v vllm-hf-cache:/root/.cache/huggingface $tokenArg " +
            "$Image --model $($spec.hf) --max-model-len 8192 --gpu-memory-utilization 0.9"
-    Wsl $cmd
+    Invoke-Wsl $cmd
     Wait-Server $spec.port
     Write-Host "  server ready, testing..."
     $body = @{ model = $spec.hf; messages = @(@{ role = 'user'; content = $TestPrompt }) } | ConvertTo-Json
@@ -51,7 +51,8 @@ function Start-Model($spec) {
 }
 
 # --- 1. WSL2 ---------------------------------------------------------------
-if (-not (wsl -e bash -lc 'echo ok' 2>$null)) {
+wsl -e bash -lc 'echo ok' *> $null  # test by exit code, not output (WSL prints errors to stdout)
+if ($LASTEXITCODE -ne 0) {
     Write-Host "WSL2 not ready. Run as Administrator:" -ForegroundColor Yellow
     Write-Host "  wsl --install -d Ubuntu-22.04" -ForegroundColor Yellow
     Write-Host "then reboot and rerun this script." -ForegroundColor Yellow
@@ -60,27 +61,28 @@ if (-not (wsl -e bash -lc 'echo ok' 2>$null)) {
 Write-Host "WSL2 OK" -ForegroundColor Green
 
 # --- 2. Docker -------------------------------------------------------------
-if (-not (wsl -e bash -lc 'docker --version' 2>$null)) {
-    if (wsl -l -v 2>$null | Select-String 'docker-desktop') {
-        Write-Host "Docker Desktop is installed but not reachable from WSL." -ForegroundColor Yellow
-        Write-Host "Start Docker Desktop, enable Settings -> Resources -> WSL Integration -> Ubuntu," -ForegroundColor Yellow
-        Write-Host "then rerun this script." -ForegroundColor Yellow
-        exit 1
+wsl -e bash -lc 'docker --version' *> $null
+if ($LASTEXITCODE -ne 0) {
+    # wsl -l -v output is UTF-16-spaced and doesn't match plain 'docker-desktop',
+    # so detect the install by the executable path instead
+    if (-not (Test-Path 'C:\Program Files\Docker\Docker\Docker Desktop.exe')) {
+        Write-Host "Docker Desktop not found. Installing (needs admin + restart)..." -ForegroundColor Yellow
+        winget install -e --id Docker.DockerDesktop
     }
-    Write-Host "Docker not found. Installing Docker Desktop (needs admin + restart)..." -ForegroundColor Yellow
-    winget install -e --id Docker.DockerDesktop
-    Write-Host "Start Docker Desktop, enable WSL integration for your distro, then rerun." -ForegroundColor Yellow
+    Write-Host "Docker Desktop is installed but not reachable from WSL." -ForegroundColor Yellow
+    Write-Host "Start Docker Desktop, enable Settings -> Resources -> WSL Integration -> Ubuntu," -ForegroundColor Yellow
+    Write-Host "then rerun this script." -ForegroundColor Yellow
     exit 1
 }
 Write-Host "Docker OK" -ForegroundColor Green
 
 # --- 3. GPU check ----------------------------------------------------------
-Wsl 'nvidia-smi' | Out-Null
+Invoke-Wsl 'nvidia-smi' | Out-Null
 Write-Host "GPU OK" -ForegroundColor Green
 
 # --- 4. Image --------------------------------------------------------------
 Write-Host "Pulling $Image (first run, may take a while)..." -ForegroundColor Cyan
-Wsl "docker pull $Image"
+Invoke-Wsl "docker pull $Image"
 
 # --- 5. Serve + test -------------------------------------------------------
 if (-not $env:HF_TOKEN) {
@@ -90,7 +92,7 @@ $targets = if ($Model -eq 'all') { $Models.Keys } else { @($Model) }
 foreach ($name in $targets) {
     Start-Model $Models[$name]
     if ($Model -eq 'all' -and $targets.Count -gt 1) {
-        Wsl "docker stop $($Models[$name].container)"
+        Invoke-Wsl "docker stop $($Models[$name].container)"
         Write-Host "  stopped $($Models[$name].container) to free VRAM for the next model" -ForegroundColor DarkGray
     }
 }
