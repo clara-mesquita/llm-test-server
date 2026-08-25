@@ -1,4 +1,3 @@
-__pycache__/
-*.pyc
-.venv/
-results/
+# run artifacts
+*.log
+ollama-benchmark-results.json
