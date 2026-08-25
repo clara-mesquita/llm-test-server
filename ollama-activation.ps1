@@ -7,15 +7,18 @@ irm https://ollama.com/install.ps1 | iex
 $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
             [System.Environment]::GetEnvironmentVariable('Path', 'User')
 
-# The installer may not start the server in non-interactive sessions - start it explicitly
-Write-Host "=== Starting Ollama server ===" -ForegroundColor Cyan
-Start-Process "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" -ArgumentList 'serve' -WindowStyle Hidden
-$deadline = (Get-Date).AddSeconds(90)
-do {
-    Start-Sleep 2
-    ollama list *> $null
-} until ($LASTEXITCODE -eq 0 -or (Get-Date) -gt $deadline)
-if ($LASTEXITCODE -ne 0) { throw 'Ollama server did not start within 90s' }
+# Only start the server if none is already running (the tray app may already own port 11434)
+ollama list *> $null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "=== Starting Ollama server ===" -ForegroundColor Cyan
+    Start-Process "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" -ArgumentList 'serve' -WindowStyle Hidden
+    $deadline = (Get-Date).AddSeconds(90)
+    do {
+        Start-Sleep 2
+        ollama list *> $null
+    } until ($LASTEXITCODE -eq 0 -or (Get-Date) -gt $deadline)
+    if ($LASTEXITCODE -ne 0) { throw 'Ollama server did not start within 90s' }
+}
 Write-Host '  server ready' -ForegroundColor Green
 
 Write-Host "=== Pulling models ===" -ForegroundColor Cyan
