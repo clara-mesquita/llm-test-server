@@ -7,16 +7,30 @@ irm https://ollama.com/install.ps1 | iex
 $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
             [System.Environment]::GetEnvironmentVariable('Path', 'User')
 
+# The installer may not start the server in non-interactive sessions - start it explicitly
+Write-Host "=== Starting Ollama server ===" -ForegroundColor Cyan
+Start-Process "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" -ArgumentList 'serve' -WindowStyle Hidden
+$deadline = (Get-Date).AddSeconds(90)
+do {
+    Start-Sleep 2
+    ollama list *> $null
+} until ($LASTEXITCODE -eq 0 -or (Get-Date) -gt $deadline)
+if ($LASTEXITCODE -ne 0) { throw 'Ollama server did not start within 90s' }
+Write-Host '  server ready' -ForegroundColor Green
+
 Write-Host "=== Pulling models ===" -ForegroundColor Cyan
-ollama pull llama3.2:3b
-ollama pull gemma3:4b
-ollama pull qwen3:8b
+foreach ($m in @('llama3.2:3b', 'gemma3:4b', 'qwen3:8b')) {
+    Write-Host "  pulling $m..."
+    ollama pull $m
+    if ($LASTEXITCODE -ne 0) { throw "ollama pull $m failed (exit $LASTEXITCODE)" }
+}
 
 Write-Host "=== Testing models ===" -ForegroundColor Cyan
 $prompt = 'Explain the three more important statistical methods for data analysis'
 foreach ($model in @('llama3.2:3b', 'gemma3:4b', 'qwen3:8b')) {
     Write-Host "--- $model ---" -ForegroundColor Yellow
     ollama run $model $prompt
+    if ($LASTEXITCODE -ne 0) { throw "ollama run $model failed (exit $LASTEXITCODE)" }
 }
 
 Write-Host "=== ollama ps ===" -ForegroundColor Cyan

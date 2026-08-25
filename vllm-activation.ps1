@@ -61,7 +61,13 @@ Write-Host "WSL2 OK" -ForegroundColor Green
 
 # --- 2. Docker -------------------------------------------------------------
 if (-not (wsl -e bash -lc 'docker --version' 2>$null)) {
-    Write-Host "Docker not found inside WSL2. Installing Docker Desktop (needs admin + restart)..." -ForegroundColor Yellow
+    if (wsl -l -v 2>$null | Select-String 'docker-desktop') {
+        Write-Host "Docker Desktop is installed but not reachable from WSL." -ForegroundColor Yellow
+        Write-Host "Start Docker Desktop, enable Settings -> Resources -> WSL Integration -> Ubuntu," -ForegroundColor Yellow
+        Write-Host "then rerun this script." -ForegroundColor Yellow
+        exit 1
+    }
+    Write-Host "Docker not found. Installing Docker Desktop (needs admin + restart)..." -ForegroundColor Yellow
     winget install -e --id Docker.DockerDesktop
     Write-Host "Start Docker Desktop, enable WSL integration for your distro, then rerun." -ForegroundColor Yellow
     exit 1
