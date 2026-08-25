@@ -1,7 +1,14 @@
 $ErrorActionPreference = 'Stop'
 
-Write-Host "=== Installing Ollama ===" -ForegroundColor Cyan
-irm https://ollama.com/install.ps1 | iex
+# Install only if missing - the installer restarts the app and leaves a window
+# with no listener on port 11434, so re-running it every time causes
+# "connection actively refused" failures for anything else hitting the API.
+if (-not (Test-Path "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe")) {
+    Write-Host "=== Installing Ollama ===" -ForegroundColor Cyan
+    irm https://ollama.com/install.ps1 | iex
+} else {
+    Write-Host "Ollama already installed, skipping installer (avoid restarting the server)" -ForegroundColor Green
+}
 
 # Refresh PATH so the newly installed ollama binary is visible in this session
 $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
