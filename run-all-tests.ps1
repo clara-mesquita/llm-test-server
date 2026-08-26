@@ -8,7 +8,7 @@ param([int]$Rounds = 10)
 
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
-$ResultsDir = Join-Path $PSScriptRoot 'results'
+$ResultsDir = Join-Path $PSScriptRoot 'results_personal_pc'
 New-Item -ItemType Directory -Force -Path $ResultsDir | Out-Null
 
 function Invoke-Ps1($path) {
@@ -31,9 +31,9 @@ for ($r = 1; $r -le $Rounds; $r++) {
     Invoke-Py   'ollama-benchmark.py'
     Move-Item -Force '.\ollama-benchmark-results.json' (Join-Path $ResultsDir "ollama-benchmark-$tag.json")
 
-    Invoke-Ps1 '.\vllm-activation.ps1'   # default -Model all: tests each model, stops containers after
-    Invoke-Py   'vllm-benchmark.py'
-    Move-Item -Force '.\vllm-benchmark-results.json' (Join-Path $ResultsDir "vllm-benchmark-$tag.json")
+    # Invoke-Ps1 '.\vllm-activation.ps1'   # default -Model all: tests each model, stops containers after
+    # Invoke-Py   'vllm-benchmark.py'
+    # Move-Item -Force '.\vllm-benchmark-results.json' (Join-Path $ResultsDir "vllm-benchmark-$tag.json")
 }
 
 Write-Host "`nAll $Rounds rounds done. Results in $ResultsDir" -ForegroundColor Green

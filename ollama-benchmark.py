@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Benchmark llama3.2:3b, gemma3:4b, qwen3:8b via the Ollama HTTP API.
+"""Benchmark same-size models via the Ollama HTTP API.
+
+Models are grouped in parameter-size tiers (4b / 8b / 16b) so each tier is an
+apples-to-apples comparison of models of ~equal size. Exact param counts are
+noted inline; no family has an exact match at every size, so each tier uses
+the closest real model (e.g. gemma has no 8B -> gemma2:9b).
 
 Run:  python ollama-benchmark.py   (Ollama server must be running)
 """
@@ -8,7 +13,25 @@ import json
 import urllib.request
 
 BASE = "http://localhost:11434"
-MODELS = ["llama3.2:3b", "gemma3:4b", "qwen3:8b"]
+
+# tier -> {family -> (ollama tag, param label)}
+MODELS = {
+    "4b": {
+        "llama": ("llama3.2:3b", "3B"),
+        "gemma": ("gemma4:e4b",  "4.5B"),
+        "qwen":  ("qwen3:4b",    "4B"),
+    },
+    "8b": {
+        "llama": ("llama3.1:8b", "8B"),
+        "gemma": ("gemma2:9b",   "9B"),  # gemma4 has no 8B; gemma2:9b is closest
+        "qwen":  ("qwen3:8b",    "8B"),
+    },
+    "16b": {
+        "llama": ("llama4:scout", "17B"),  # MoE: 109B total / 17B active
+        "gemma": ("gemma4:12b",   "12B"),
+        "qwen":  ("qwen3:14b",    "14B"),
+    },
+}
 
 PROMPTS = {
     "small": "What is 2+2?",
@@ -33,7 +56,7 @@ def generate(model, prompt):
             "stream": False,
             "options": {
                 "num_ctx": 8192,
-                "num_predict": 256,  # cap output so verbose models (gemma) don't run for minutes
+                "num_predict": 256,  # cap output so verbose models don't run for minutes
             },  # consistent ctx so the large prompt isn't truncated
         }
     ).encode()
@@ -50,33 +73,37 @@ def tps(count, duration_ns):
 
 def main():
     runs = []
-    for model in MODELS:
-        print(f"=== {model} ===")
-        print("  warming up (load model, excluded from results)...")
-        generate(model, "ping")
-        for size, prompt in PROMPTS.items():
-            print(f"  running {size} prompt...")
-            r = generate(model, prompt)
-            runs.append(
-                {
-                    "model": model,
-                    "size": size,
-                    "total_duration_ns": r["total_duration"],
-                    "load_duration_ns": r["load_duration"],
-                    "prompt_eval_count": r["prompt_eval_count"],
-                    "prompt_eval_duration_ns": r["prompt_eval_duration"],
-                    "eval_count": r["eval_count"],
-                    "eval_duration_ns": r["eval_duration"],
-                    "prompt_tps": tps(
-                        r["prompt_eval_count"], r["prompt_eval_duration"]
-                    ),
-                    "eval_tps": tps(r["eval_count"], r["eval_duration"]),
-                }
-            )
-            print(
-                f"    eval {r['eval_count']} tokens in {r['eval_duration'] / 1e9:.2f}s "
-                f"-> {tps(r['eval_count'], r['eval_duration'])} tok/s"
-            )
+    for tier, families in MODELS.items():
+        for family, (tag, params) in families.items():
+            print(f"=== {tier} / {family} ({tag}, {params}) ===")
+            print("  warming up (load model, excluded from results)...")
+            generate(tag, "ping")
+            for size, prompt in PROMPTS.items():
+                print(f"  running {size} prompt...")
+                r = generate(tag, prompt)
+                runs.append(
+                    {
+                        "model": tag,
+                        "family": family,
+                        "tier": tier,
+                        "params": params,
+                        "size": size,
+                        "total_duration_ns": r["total_duration"],
+                        "load_duration_ns": r["load_duration"],
+                        "prompt_eval_count": r["prompt_eval_count"],
+                        "prompt_eval_duration_ns": r["prompt_eval_duration"],
+                        "eval_count": r["eval_count"],
+                        "eval_duration_ns": r["eval_duration"],
+                        "prompt_tps": tps(
+                            r["prompt_eval_count"], r["prompt_eval_duration"]
+                        ),
+                        "eval_tps": tps(r["eval_count"], r["eval_duration"]),
+                    }
+                )
+                print(
+                    f"    eval {r['eval_count']} tokens in {r['eval_duration'] / 1e9:.2f}s "
+                    f"-> {tps(r['eval_count'], r['eval_duration'])} tok/s"
+                )
 
     out = "ollama-benchmark-results.json"
     with open(out, "w", encoding="utf-8") as f:
@@ -85,7 +112,7 @@ def main():
     print("\n=== Summary ===")
     for row in runs:
         print(
-            f"{row['model']:<12} {row['size']:<7} total={row['total_duration_ns'] / 1e9:8.2f}s "
+            f"{row['tier']:<4} {row['family']:<6} {row['size']:<7} total={row['total_duration_ns'] / 1e9:8.2f}s "
             f"eval={row['eval_count']:>5} tok {row['eval_duration_ns'] / 1e9:8.2f}s "
             f"-> {row['eval_tps']:>7.1f} tok/s"
         )

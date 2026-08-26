@@ -28,8 +28,15 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host '  server ready' -ForegroundColor Green
 
+# Same-size tiers (4b / 8b / 16b); gemma4 needs ollama v0.20+ (installed: check `ollama --version`)
+$Models = @(
+    'llama3.2:3b', 'gemma4:e4b', 'qwen3:4b',
+    'llama3.1:8b', 'gemma2:9b', 'qwen3:8b',
+    'llama4:scout', 'gemma4:12b', 'qwen3:14b'
+)
+
 Write-Host "=== Pulling models ===" -ForegroundColor Cyan
-foreach ($m in @('llama3.2:3b', 'gemma3:4b', 'qwen3:8b')) {
+foreach ($m in $Models) {
     Write-Host "  pulling $m..."
     ollama pull $m
     if ($LASTEXITCODE -ne 0) { throw "ollama pull $m failed (exit $LASTEXITCODE)" }
@@ -37,7 +44,7 @@ foreach ($m in @('llama3.2:3b', 'gemma3:4b', 'qwen3:8b')) {
 
 Write-Host "=== Testing models ===" -ForegroundColor Cyan
 $prompt = 'Explain the three more important statistical methods for data analysis'
-foreach ($model in @('llama3.2:3b', 'gemma3:4b', 'qwen3:8b')) {
+foreach ($model in $Models) {
     Write-Host "--- $model ---" -ForegroundColor Yellow
     ollama run $model $prompt
     if ($LASTEXITCODE -ne 0) { throw "ollama run $model failed (exit $LASTEXITCODE)" }
