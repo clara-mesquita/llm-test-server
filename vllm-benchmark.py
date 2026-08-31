@@ -1,54 +1,60 @@
 #!/usr/bin/env python3
-"""Benchmark llama3.2 / gemma3 / qwen3 served by vLLM (WSL2 + Docker).
+"""Benchmark same-size models via the vLLM OpenAI-compatible API (WSL2 + Docker).
+
+Mirrors ollama-benchmark.py: same tiers/families/prompts and the same output
+schema, so ollama-results-avg.py aggregates the JSON unchanged.
+
+Timing note: vLLM's OpenAI API does not expose per-request prompt/eval
+durations, so they are approximated from the stream — prompt_duration ~
+time-to-first-token (TTFT), eval_duration ~ total - TTFT.
 
 Run:  python vllm-benchmark.py
-Prereqs: vllm-activation.ps1 run once (creates the containers).
-The script starts any stopped container itself, and stops containers it
-started after each model so models don't fight over VRAM.
-
-Timing note: vLLM's OpenAI-compatible API (pinned image v0.8.5.post1) does
-not expose per-request prompt/eval durations, so total_duration_ns is the
-client-side wall time and eval/prompt durations are None.
+Prereqs: Docker Desktop + WSL2 up (vllm-activation.ps1); HF_TOKEN for gated models.
+Env:   VLLM_IMAGE       (default vllm/vllm-openai:v0.28.0)
+       VLLM_EXTRA_ARGS  extra vLLM flags, e.g. "--quantization awq --cpu-offload-gb 4"
 """
+
 import json
+import os
 import subprocess
 import time
 import urllib.request
 
+IMAGE = os.environ.get("VLLM_IMAGE", "vllm/vllm-openai:v0.28.0")
+EXTRA_ARGS = os.environ.get("VLLM_EXTRA_ARGS", "")
+MAX_TOKENS = 256  # mirror ollama's num_predict cap
+
+# tier -> family -> (HF model id, param label, port, container name)
 MODELS = {
-    "llama32": {"hf": "meta-llama/Llama-3.2-3B-Instruct", "port": 8000, "container": "vllm-llama32"},
-    "gemma3":  {"hf": "google/gemma-3-4b-it",              "port": 8001, "container": "vllm-gemma3"},
-    "qwen3":   {"hf": "Qwen/Qwen3-8B-Instruct",            "port": 8002, "container": "vllm-qwen3"},
+    "4b": {
+        "llama": ("meta-llama/Llama-3.2-3B-Instruct", "3B",   8000, "vllm-llama-3b"),
+        "gemma": ("google/gemma-4-e4b-it",            "4.5B", 8001, "vllm-gemma-4b"),
+        "qwen":  ("Qwen/Qwen3-4B",                    "4B",   8002, "vllm-qwen-4b"),
+    },
+    "8b": {
+        "llama": ("meta-llama/Llama-3.1-8B-Instruct", "8B",   8010, "vllm-llama-8b"),
+        "gemma": ("google/gemma-2-9b-it",             "9B",   8011, "vllm-gemma-9b"),
+        "qwen":  ("Qwen/Qwen3-8B-Instruct",           "8B",   8012, "vllm-qwen-8b"),
+    },
+    "16b": {
+        "llama": ("meta-llama/Llama-4-Scout-17B-16E-Instruct", "17B", 8020, "vllm-llama-17b"),
+        "gemma": ("google/gemma-4-12b-it",            "12B",  8021, "vllm-gemma-12b"),
+        "qwen":  ("Qwen/Qwen3-14B",                   "14B",  8022, "vllm-qwen-14b"),
+    },
 }
 
 PROMPTS = {
     "small": "What is 2+2?",
-    "medium": ("Write a detailed technical essay (about 800 words) comparing supervised, "
-               "unsupervised, and reinforcement learning: definitions, typical algorithms, "
-               "data requirements, real-world applications, and common pitfalls. "
-               "Structure the essay with headings."),
-    "large": ("You are a senior data scientist asked to perform a full exploratory data analysis "
-              "and modeling plan on the following e-commerce sales dataset (10,000 rows, fields: "
-              "order_date, category, units_sold, unit_price, discount_rate, region, customer_segment, "
-              "returned_flag).\n"
-              "\n"
-              "1. Data quality: list the exact steps you would take to clean this dataset (missing values, "
-              "outliers, inconsistent categories) and justify each choice statistically.\n"
-              "2. Univariate analysis: specify which summary statistics and distribution checks you would "
-              "run for the numeric columns and why.\n"
-              "3. Hypothesis testing: formulate three concrete business hypotheses (e.g. discount rate vs "
-              "return rate, region vs revenue, segment vs order size), pick the appropriate statistical "
-              "test for each (with assumptions and their verification), and state how you would interpret "
-              "a significant vs non-significant result.\n"
-              "4. Predictive model: design a regression model for daily revenue, listing feature engineering "
-              "steps, model selection strategy, cross-validation scheme, and the exact metrics you would "
-              "report (with formulas).\n"
-              "5. Write complete, runnable Python code (pandas, scipy, sklearn) implementing steps 1, 3, and 4 "
-              "end-to-end on this dataset, with comments.\n"
-              "6. Finally, summarize in under 200 words what the analysis would reveal about discounting "
-              "strategy if the results came back the way you expect.\n"
-              "\n"
-              "Be rigorous, concrete, and specific; no generic filler."),
+    "medium": (
+        "Explain the key differences between SQL and NoSQL databases, "
+        "with one concrete use case for each. Answer in about 150 words."
+    ),
+    "large": (
+        "Write a detailed technical essay (about 800 words) comparing supervised, "
+        "unsupervised, and reinforcement learning: definitions, typical algorithms, "
+        "data requirements, real-world applications, and common pitfalls. "
+        "Structure the essay with headings."
+    ),
 }
 
 
@@ -64,66 +70,109 @@ def server_up(port):
         return False
 
 
-def wait_server(port, timeout=900):
+def wait_server(port, timeout=1800):
     deadline = time.time() + timeout
     while time.time() < deadline:
         if server_up(port):
             return
         time.sleep(3)
-    raise TimeoutError(f"server on :{port} not ready")
+    raise TimeoutError(f"vLLM on :{port} not ready in {timeout}s")
 
 
-def chat(model, prompt):
+def start_container(hf, port, container):
+    token = f"-e HF_TOKEN={os.environ['HF_TOKEN']}" if os.environ.get("HF_TOKEN") else ""
+    # VLLM_WSL2_ENABLE_PIN_MEMORY=1: vLLM's V2 runner needs pinned memory for UVA,
+    # which is off by default on WSL2 -> otherwise "RuntimeError: UVA is not available"
+    wsl(
+        f"docker rm -f {container} 2>/dev/null; "
+        f"docker run -d --name {container} --gpus all -p {port}:8000 "
+        f"--ipc=host --shm-size=8gb -v vllm-hf-cache:/root/.cache/huggingface "
+        f"-e VLLM_WSL2_ENABLE_PIN_MEMORY=1 {token} {IMAGE} "
+        f"--model {hf} --max-model-len 8192 --gpu-memory-utilization 0.9 {EXTRA_ARGS}"
+    )
+
+
+def stop_container(container):
+    subprocess.run(["wsl", "-e", "bash", "-lc", f"docker rm -f {container} 2>/dev/null"])
+
+
+def generate(model, prompt):
+    """Stream one chat completion; return timing + token counts (all int)."""
     body = json.dumps({
         "model": model["hf"],
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 4096,
+        "max_tokens": MAX_TOKENS,
         "temperature": 0,
-        "stream": False,
+        "stream": True,
+        "stream_options": {"include_usage": True},
     }).encode()
-    req = urllib.request.Request(f"http://localhost:{model['port']}/v1/chat/completions",
-                                 data=body, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(
+        f"http://localhost:{model['port']}/v1/chat/completions",
+        data=body, headers={"Content-Type": "application/json"},
+    )
     t0 = time.perf_counter()
+    ttft = None
+    usage = {}
     with urllib.request.urlopen(req) as resp:
-        r = json.loads(resp.read())
-    wall_ns = int((time.perf_counter() - t0) * 1e9)
-    return r, wall_ns
+        for line in resp:
+            line = line.decode("utf-8").strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if payload == "[DONE]":
+                break
+            chunk = json.loads(payload)
+            for choice in chunk.get("choices", []):
+                if choice.get("delta", {}).get("content") and ttft is None:
+                    ttft = time.perf_counter()
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+    total_ns = int((time.perf_counter() - t0) * 1e9)
+    prompt_ns = int(((ttft if ttft is not None else time.perf_counter()) - t0) * 1e9)
+    eval_ns = max(total_ns - prompt_ns, 0)
+    return {
+        "total_duration_ns": total_ns,
+        "prompt_duration_ns": prompt_ns,
+        "eval_duration_ns": eval_ns,
+        "prompt_count": usage.get("prompt_tokens", 0),
+        "eval_count": usage.get("completion_tokens", 0),
+    }
+
+
+def tps(count, ns):
+    return round(count / (ns / 1e9), 1) if ns > 0 else 0
 
 
 def main():
     runs = []
-    for name, model in MODELS.items():
-        started = False
-        if not server_up(model["port"]):
-            print(f"=== {name}: starting container {model['container']} ===")
-            wsl(f"docker start {model['container']}")
-            wait_server(model["port"])
-            started = True
-        print(f"=== {name} ===")
-        print("  warming up (model load excluded from results)...")
-        chat(model, "ping")
-        for size, prompt in PROMPTS.items():
-            print(f"  running {size} prompt...")
-            r, wall_ns = chat(model, prompt)
-            usage = r.get("usage", {})
-            eval_count = usage.get("completion_tokens", 0)
-            runs.append({
-                "model": name,
-                "size": size,
-                "total_duration_ns": wall_ns,
-                "load_duration_ns": None,          # vLLM loads at server start, not per request
-                "prompt_eval_count": usage.get("prompt_tokens", 0),
-                "prompt_eval_duration_ns": None,   # not exposed by vLLM API
-                "eval_count": eval_count,
-                "eval_duration_ns": None,          # not exposed by vLLM API
-                "finish_reason": r["choices"][0].get("finish_reason"),
-                "eval_tps": round(eval_count / (wall_ns / 1e9), 1) if wall_ns > 0 else 0,
-            })
-            print(f"    eval {eval_count} tokens in {wall_ns / 1e9:.2f}s "
-                  f"-> {runs[-1]['eval_tps']} tok/s (wall)")
-        if started:
-            wsl(f"docker stop {model['container']}")
-            print(f"  stopped {model['container']} (I started it)")
+    for tier, families in MODELS.items():
+        for family, (hf, params, port, container) in families.items():
+            model = {"hf": hf, "port": port}
+            print(f"=== {tier} / {family} ({hf}, {params}) ===")
+            print("  starting container...")
+            start_container(hf, port, container)
+            wait_server(port)
+            print("  warming up (excluded from results)...")
+            generate(model, "ping")
+            for size, prompt in PROMPTS.items():
+                print(f"  running {size} prompt...")
+                r = generate(model, prompt)
+                runs.append({
+                    "model": hf, "family": family, "tier": tier,
+                    "params": params, "size": size,
+                    "total_duration_ns": r["total_duration_ns"],
+                    "load_duration_ns": 0,  # model loaded at server start
+                    "prompt_eval_count": r["prompt_count"],
+                    "prompt_eval_duration_ns": r["prompt_duration_ns"],
+                    "eval_count": r["eval_count"],
+                    "eval_duration_ns": r["eval_duration_ns"],
+                    "prompt_tps": tps(r["prompt_count"], r["prompt_duration_ns"]),
+                    "eval_tps": tps(r["eval_count"], r["eval_duration_ns"]),
+                })
+                print(f"    {r['eval_count']} tok in {r['eval_duration_ns'] / 1e9:.2f}s "
+                      f"-> {runs[-1]['eval_tps']} tok/s")
+            stop_container(container)
+            print(f"  stopped {container}")
 
     out = "vllm-benchmark-results.json"
     with open(out, "w", encoding="utf-8") as f:
@@ -131,9 +180,9 @@ def main():
 
     print("\n=== Summary ===")
     for row in runs:
-        print(f"{row['model']:<8} {row['size']:<7} total={row['total_duration_ns'] / 1e9:8.2f}s "
-              f"eval={row['eval_count']:>5} tok -> {row['eval_tps']:>7.1f} tok/s "
-              f"[{row['finish_reason']}]")
+        print(f"{row['tier']:<4} {row['family']:<6} {row['size']:<7} "
+              f"eval={row['eval_count']:>4} tok {row['eval_duration_ns'] / 1e9:7.2f}s "
+              f"-> {row['eval_tps']:>7.1f} tok/s")
     print(f"Results saved to {out}")
 
 

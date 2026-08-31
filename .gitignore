@@ -1,6 +1,9 @@
 # run artifacts
+logs/
 *.log
 ollama-benchmark-results.json
 
 # python
 __pycache__/
+
+results/
