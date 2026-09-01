@@ -1,11 +1,13 @@
 # vllm-activation.ps1
 # Set up vLLM on Windows (WSL2 + Docker) and smoke-test it.
 #
-# Usage:  .\vllm-activation.ps1 [-Model <hf-id>] [-Image <docker-image>] [-Port <port>]
+# Usage:  .\vllm-activation.ps1 [-Model <hf-id>] [-Image <docker-image>] [-Port <port>] [-Reset] [-DockerCheck]
 #   -Model : HF model for the smoke test (default Qwen/Qwen2.5-0.5B-Instruct: non-gated,
 #            0.5B -> fits a 4GB VRAM GPU)
 #   -Image : vLLM image (default vllm/vllm-openai:v0.28.0)
 #   -Port  : host port (default 8080; avoid 8000 which this machine uses for other apps)
+#   -Reset : remove vLLM containers, images, and the vLLM Hugging Face cache before the smoke test
+#   -DockerCheck : start Docker if needed and verify it can run hello-world; does not require a GPU
 #
 # Prereqs: NVIDIA GPU, Windows 10/11 with virtualization enabled.
 #          HF_TOKEN env var for gated models (llama / gemma2 / qwen3-8b).
@@ -17,7 +19,9 @@
 param(
     [string]$Model = 'Qwen/Qwen2.5-0.5B-Instruct',
     [string]$Image = 'vllm/vllm-openai:v0.28.0',
-    [int]$Port = 8080
+    [int]$Port = 8080,
+    [switch]$Reset,
+    [switch]$DockerCheck
 )
 
 $ErrorActionPreference = 'Stop'
@@ -63,6 +67,19 @@ if (-not (Test-Docker)) {
     }
 }
 Write-Host "Docker OK" -ForegroundColor Green
+
+if ($Reset) {
+    Write-Host "Removing vLLM Docker resources..." -ForegroundColor Cyan
+    Invoke-Wsl "docker ps -aq --filter 'name=^vllm-' | xargs -r docker rm -f; docker images -q 'vllm/*' | xargs -r docker rmi -f; docker volume rm vllm-hf-cache 2>/dev/null || true"
+    Write-Host "vLLM Docker resources removed" -ForegroundColor Green
+}
+
+if ($DockerCheck) {
+    Write-Host "Testing Docker with hello-world..." -ForegroundColor Cyan
+    Invoke-Wsl 'docker run --rm hello-world'
+    Write-Host "Docker can initialize and run containers" -ForegroundColor Green
+    exit 0
+}
 
 # --- 3. GPU check -----------------------------------------------------------
 Invoke-Wsl 'nvidia-smi' | Out-Null
