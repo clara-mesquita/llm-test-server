@@ -1,23 +1,26 @@
 # vllm-activation.ps1
 # Set up vLLM on Windows (WSL2 + Docker) and smoke-test it.
 #
-# Usage:  .\vllm-activation.ps1 [-Model <hf-id>] [-Image <docker-image>]
-#   -Model : HF model for the smoke test (default Qwen/Qwen3-0.6B: non-gated, fits 4GB VRAM)
+# Usage:  .\vllm-activation.ps1 [-Model <hf-id>] [-Image <docker-image>] [-Port <port>]
+#   -Model : HF model for the smoke test (default Qwen/Qwen2.5-0.5B-Instruct: non-gated,
+#            0.5B -> fits a 4GB VRAM GPU)
 #   -Image : vLLM image (default vllm/vllm-openai:v0.28.0)
+#   -Port  : host port (default 8080; avoid 8000 which this machine uses for other apps)
 #
 # Prereqs: NVIDIA GPU, Windows 10/11 with virtualization enabled.
 #          HF_TOKEN env var for gated models (llama / gemma2 / qwen3-8b).
 #
-# Note: Docker Desktop is auto-started here if its engine is down, and
-# VLLM_WSL2_ENABLE_PIN_MEMORY=1 is set so vLLM's V2 runner doesn't crash on WSL2
-# with "RuntimeError: UVA is not available".
+# Notes: Docker Desktop is auto-started if its engine is down. Flags are tuned for a
+# small GPU: --enforce-eager (skip CUDA graphs, which can fail on WSL2), low
+# --max-model-len and --gpu-memory-utilization so it fits 4GB VRAM.
+# VLLM_WSL2_ENABLE_PIN_MEMORY=1 avoids "RuntimeError: UVA is not available" on WSL2.
 param(
-    [string]$Model = 'Qwen/Qwen3-0.6B',
-    [string]$Image = 'vllm/vllm-openai:v0.28.0'
+    [string]$Model = 'Qwen/Qwen2.5-0.5B-Instruct',
+    [string]$Image = 'vllm/vllm-openai:v0.28.0',
+    [int]$Port = 8080
 )
 
 $ErrorActionPreference = 'Stop'
-$Port = 8000
 $Container = 'vllm-smoke'
 $TestPrompt = 'What is 2+2?'
 
@@ -72,6 +75,7 @@ Invoke-Wsl "docker pull $Image"
 # --- 5. Smoke test ----------------------------------------------------------
 if (-not $env:HF_TOKEN) {
     Write-Host "NOTE: HF_TOKEN not set - gated model downloads will fail (401)." -ForegroundColor Yellow
+    Write-Host "      $Model is public, so this smoke test does not need it." -ForegroundColor Yellow
 }
 Write-Host "Smoke test: $Model on :$Port" -ForegroundColor Cyan
 $tokenArg = if ($env:HF_TOKEN) { "-e HF_TOKEN=$($env:HF_TOKEN)" } else { '' }
@@ -79,17 +83,24 @@ $cmd = "docker rm -f $Container 2>/dev/null; " +
        "docker run -d --name $Container --gpus all -p ${Port}:8000 " +
        "--ipc=host --shm-size=8gb -v vllm-hf-cache:/root/.cache/huggingface " +
        "-e VLLM_WSL2_ENABLE_PIN_MEMORY=1 $tokenArg " +
-       "$Image --model $Model --max-model-len 4096 --gpu-memory-utilization 0.9"
+       "$Image --model $Model --max-model-len 1024 --gpu-memory-utilization 0.6 --enforce-eager"
 Invoke-Wsl $cmd
 
-$deadline = (Get-Date).AddMinutes(10)
+$deadline = (Get-Date).AddMinutes(12)
 $ready = $false
 while ((Get-Date) -lt $deadline) {
+    # fail fast if the container crashed (OOM / CUDA error) instead of waiting 12 min
+    $state = (wsl -e bash -lc "docker inspect -f '{{.State.Status}}' $Container 2>/dev/null").Trim()
+    if ($state -eq 'exited' -or $state -eq 'dead') {
+        Write-Host "container exited early ($state). Logs:" -ForegroundColor Red
+        Invoke-Wsl "docker logs --tail 60 $Container"
+        throw "vLLM container exited: $state"
+    }
     try { Invoke-RestMethod "http://localhost:$Port/v1/models" -TimeoutSec 5 | Out-Null; $ready = $true; break } catch { Start-Sleep 3 }
 }
 if (-not $ready) {
     Write-Host "server did not become ready. Logs:" -ForegroundColor Red
-    Invoke-Wsl "docker logs $Container"
+    Invoke-Wsl "docker logs --tail 60 $Container"
     throw "vLLM server did not start"
 }
 Write-Host "server ready, testing..." -ForegroundColor Green

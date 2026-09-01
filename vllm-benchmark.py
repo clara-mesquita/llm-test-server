@@ -11,7 +11,8 @@ time-to-first-token (TTFT), eval_duration ~ total - TTFT.
 Run:  python vllm-benchmark.py
 Prereqs: Docker Desktop + WSL2 up (vllm-activation.ps1); HF_TOKEN for gated models.
 Env:   VLLM_IMAGE       (default vllm/vllm-openai:v0.28.0)
-       VLLM_EXTRA_ARGS  extra vLLM flags, e.g. "--quantization awq --cpu-offload-gb 4"
+       VLLM_PORT        host port (default 8080; models run one at a time)
+       VLLM_EXTRA_ARGS  extra vLLM flags, e.g. "--quantization awq --cpu-offload-gb 8"
 """
 
 import json
@@ -21,25 +22,27 @@ import time
 import urllib.request
 
 IMAGE = os.environ.get("VLLM_IMAGE", "vllm/vllm-openai:v0.28.0")
+PORT = int(os.environ.get("VLLM_PORT", "8080"))
 EXTRA_ARGS = os.environ.get("VLLM_EXTRA_ARGS", "")
 MAX_TOKENS = 256  # mirror ollama's num_predict cap
 
-# tier -> family -> (HF model id, param label, port, container name)
+# tier -> family -> (HF model id, param label, container name)
+# models run one at a time on PORT, so no per-model ports needed
 MODELS = {
     "4b": {
-        "llama": ("meta-llama/Llama-3.2-3B-Instruct", "3B",   8000, "vllm-llama-3b"),
-        "gemma": ("google/gemma-4-e4b-it",            "4.5B", 8001, "vllm-gemma-4b"),
-        "qwen":  ("Qwen/Qwen3-4B",                    "4B",   8002, "vllm-qwen-4b"),
+        "llama": ("meta-llama/Llama-3.2-3B-Instruct", "3B",   "vllm-llama-3b"),
+        "gemma": ("google/gemma-4-e4b-it",            "4.5B", "vllm-gemma-4b"),
+        "qwen":  ("Qwen/Qwen3-4B",                    "4B",   "vllm-qwen-4b"),
     },
     "8b": {
-        "llama": ("meta-llama/Llama-3.1-8B-Instruct", "8B",   8010, "vllm-llama-8b"),
-        "gemma": ("google/gemma-2-9b-it",             "9B",   8011, "vllm-gemma-9b"),
-        "qwen":  ("Qwen/Qwen3-8B-Instruct",           "8B",   8012, "vllm-qwen-8b"),
+        "llama": ("meta-llama/Llama-3.1-8B-Instruct", "8B",   "vllm-llama-8b"),
+        "gemma": ("google/gemma-2-9b-it",             "9B",   "vllm-gemma-9b"),
+        "qwen":  ("Qwen/Qwen3-8B-Instruct",           "8B",   "vllm-qwen-8b"),
     },
     "16b": {
-        "llama": ("meta-llama/Llama-4-Scout-17B-16E-Instruct", "17B", 8020, "vllm-llama-17b"),
-        "gemma": ("google/gemma-4-12b-it",            "12B",  8021, "vllm-gemma-12b"),
-        "qwen":  ("Qwen/Qwen3-14B",                   "14B",  8022, "vllm-qwen-14b"),
+        "llama": ("meta-llama/Llama-4-Scout-17B-16E-Instruct", "17B", "vllm-llama-17b"),
+        "gemma": ("google/gemma-4-12b-it",            "12B",  "vllm-gemma-12b"),
+        "qwen":  ("Qwen/Qwen3-14B",                   "14B",  "vllm-qwen-14b"),
     },
 }
 
@@ -62,30 +65,30 @@ def wsl(cmd):
     subprocess.run(["wsl", "-e", "bash", "-lc", cmd], check=True)
 
 
-def server_up(port):
+def server_up():
     try:
-        urllib.request.urlopen(f"http://localhost:{port}/v1/models", timeout=3)
+        urllib.request.urlopen(f"http://localhost:{PORT}/v1/models", timeout=3)
         return True
     except OSError:
         return False
 
 
-def wait_server(port, timeout=1800):
+def wait_server(timeout=1800):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if server_up(port):
+        if server_up():
             return
         time.sleep(3)
-    raise TimeoutError(f"vLLM on :{port} not ready in {timeout}s")
+    raise TimeoutError(f"vLLM on :{PORT} not ready in {timeout}s (docker logs vllm-smoke)")
 
 
-def start_container(hf, port, container):
+def start_container(hf, container):
     token = f"-e HF_TOKEN={os.environ['HF_TOKEN']}" if os.environ.get("HF_TOKEN") else ""
     # VLLM_WSL2_ENABLE_PIN_MEMORY=1: vLLM's V2 runner needs pinned memory for UVA,
     # which is off by default on WSL2 -> otherwise "RuntimeError: UVA is not available"
     wsl(
         f"docker rm -f {container} 2>/dev/null; "
-        f"docker run -d --name {container} --gpus all -p {port}:8000 "
+        f"docker run -d --name {container} --gpus all -p {PORT}:8000 "
         f"--ipc=host --shm-size=8gb -v vllm-hf-cache:/root/.cache/huggingface "
         f"-e VLLM_WSL2_ENABLE_PIN_MEMORY=1 {token} {IMAGE} "
         f"--model {hf} --max-model-len 8192 --gpu-memory-utilization 0.9 {EXTRA_ARGS}"
@@ -96,10 +99,10 @@ def stop_container(container):
     subprocess.run(["wsl", "-e", "bash", "-lc", f"docker rm -f {container} 2>/dev/null"])
 
 
-def generate(model, prompt):
+def generate(hf, prompt):
     """Stream one chat completion; return timing + token counts (all int)."""
     body = json.dumps({
-        "model": model["hf"],
+        "model": hf,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": MAX_TOKENS,
         "temperature": 0,
@@ -107,7 +110,7 @@ def generate(model, prompt):
         "stream_options": {"include_usage": True},
     }).encode()
     req = urllib.request.Request(
-        f"http://localhost:{model['port']}/v1/chat/completions",
+        f"http://localhost:{PORT}/v1/chat/completions",
         data=body, headers={"Content-Type": "application/json"},
     )
     t0 = time.perf_counter()
@@ -146,17 +149,16 @@ def tps(count, ns):
 def main():
     runs = []
     for tier, families in MODELS.items():
-        for family, (hf, params, port, container) in families.items():
-            model = {"hf": hf, "port": port}
+        for family, (hf, params, container) in families.items():
             print(f"=== {tier} / {family} ({hf}, {params}) ===")
             print("  starting container...")
-            start_container(hf, port, container)
-            wait_server(port)
+            start_container(hf, container)
+            wait_server()
             print("  warming up (excluded from results)...")
-            generate(model, "ping")
+            generate(hf, "ping")
             for size, prompt in PROMPTS.items():
                 print(f"  running {size} prompt...")
-                r = generate(model, prompt)
+                r = generate(hf, prompt)
                 runs.append({
                     "model": hf, "family": family, "tier": tier,
                     "params": params, "size": size,

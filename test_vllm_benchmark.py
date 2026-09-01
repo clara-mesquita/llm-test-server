@@ -59,10 +59,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     srv = HTTPServer(("", 0), Handler)  # "" -> reachable via localhost
-    port = srv.server_address[1]
+    vb.PORT = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
-        r = vb.generate({"hf": "test/x", "port": port}, "What is 2+2?")
+        r = vb.generate("test/x", "What is 2+2?")
         assert r["prompt_count"] == 5, r
         assert r["eval_count"] == 4, r
         assert r["prompt_duration_ns"] > 0, r
