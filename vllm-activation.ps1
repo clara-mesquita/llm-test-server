@@ -34,8 +34,16 @@ $Container = 'vllm-smoke'
 $TestPrompt = 'What is 2+2?'
 
 function Invoke-Docker([string[]]$DockerArgs) {
-    $output = & docker @DockerArgs 2>&1
-    $exitCode = $LASTEXITCODE
+    # Docker reports normal pull progress on stderr.  Keep Stop for this
+    # script, but not while collecting a native command's output.
+    $previousErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & docker @DockerArgs 2>&1
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
     if ($output) { $output | Write-Host }
     if ($exitCode -ne 0) { throw "docker $($DockerArgs[0]) failed (exit $exitCode)" }
 }
