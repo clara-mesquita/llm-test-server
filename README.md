@@ -15,6 +15,8 @@ The command installs WSL2 or Docker Desktop if either is missing, then stops
 when Windows needs a reboot or Docker needs its first launch. Reboot when told,
 start Docker Desktop once and accept its terms, then repeat the command. A
 successful smoke test ends with `vLLM works`.
+If port 8080 is occupied, the script chooses a free port and sets `VLLM_PORT`
+for the benchmark in that same PowerShell session.
 
 The full benchmark includes gated Llama and Gemma models. Accept their model
 licenses in Hugging Face, create a read token, and set it in the same shell:

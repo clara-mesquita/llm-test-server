@@ -57,6 +57,18 @@ function Test-Docker {
     }
 }
 
+function Test-FreePort([int]$Candidate) {
+    $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Any, $Candidate)
+    try {
+        $listener.Start()
+        return $true
+    } catch {
+        return $false
+    } finally {
+        $listener.Stop()
+    }
+}
+
 function Install-Prerequisites {
     if (-not (Get-Command wsl -ErrorAction SilentlyContinue)) {
         $principal = [Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -82,6 +94,16 @@ function Install-Prerequisites {
 }
 
 if ($InstallPrerequisites) { Install-Prerequisites }
+
+if (-not (Test-FreePort $Port)) {
+    if ($PSBoundParameters.ContainsKey('Port')) {
+        throw "Port $Port is already in use. Choose a free port, for example: -Port 8081"
+    }
+    $Port = 8081..8090 | Where-Object { Test-FreePort $_ } | Select-Object -First 1
+    if (-not $Port) { throw 'No free vLLM port found in 8080-8090. Use -Port <free-port>.' }
+    Write-Host "Port 8080 is in use; using :$Port instead." -ForegroundColor Yellow
+}
+$env:VLLM_PORT = "$Port"
 
 if (-not (Test-Docker)) {
     $dockerExe = 'C:\Program Files\Docker\Docker\Docker Desktop.exe'
