@@ -25,12 +25,17 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# PowerShell 7 otherwise turns Docker stderr into an exception before this
+# script can show Docker's useful error message.
+if ($PSVersionTable.PSVersion.Major -ge 7) { $PSNativeCommandUseErrorActionPreference = $false }
 $Container = 'vllm-smoke'
 $TestPrompt = 'What is 2+2?'
 
 function Invoke-Docker([string[]]$DockerArgs) {
-    & docker @DockerArgs
-    if ($LASTEXITCODE -ne 0) { throw "docker $($DockerArgs -join ' ') failed (exit $LASTEXITCODE)" }
+    $output = & docker @DockerArgs 2>&1
+    $exitCode = $LASTEXITCODE
+    if ($output) { $output | Write-Host }
+    if ($exitCode -ne 0) { throw "docker $($DockerArgs[0]) failed (exit $exitCode)" }
 }
 
 function Test-Docker {
@@ -72,6 +77,12 @@ if ($DockerCheck) {
     Write-Host "Docker can initialize and run containers" -ForegroundColor Green
     exit 0
 }
+
+# Docker exit 125 means its daemon rejected the container before vLLM ran.
+# Check GPU passthrough with the tiny image first so the error is actionable.
+Write-Host 'Testing Docker GPU access...' -ForegroundColor Cyan
+Invoke-Docker @('run', '--rm', '--gpus', 'all', 'hello-world')
+Write-Host 'Docker GPU access OK' -ForegroundColor Green
 
 # --- Image -----------------------------------------------------------------
 Write-Host "Pulling $Image (first run, may take a while)..." -ForegroundColor Cyan

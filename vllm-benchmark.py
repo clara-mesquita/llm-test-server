@@ -63,7 +63,10 @@ PROMPTS = {
 
 
 def docker(*args, check=True):
-    return subprocess.run(["docker", *args], check=check, text=True, capture_output=True)
+    result = subprocess.run(["docker", *args], text=True, capture_output=True)
+    if check and result.returncode:
+        raise RuntimeError(f"docker {args[0]} failed (exit {result.returncode}):\n{result.stderr.strip()}")
+    return result
 
 
 def server_up(model):
