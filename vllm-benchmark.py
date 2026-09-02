@@ -10,20 +10,21 @@ time-to-first-token (TTFT), eval_duration ~ total - TTFT.
 
 Run:  python vllm-benchmark.py
 Prereqs: Docker Desktop + WSL2 up (vllm-activation.ps1); HF_TOKEN for gated models.
-Env:   VLLM_IMAGE       (default vllm/vllm-openai:v0.28.0)
+Env:   VLLM_IMAGE       (default vllm/vllm-openai:latest)
        VLLM_PORT        host port (default 8080; models run one at a time)
        VLLM_EXTRA_ARGS  extra vLLM flags, e.g. "--quantization awq --cpu-offload-gb 8"
 """
 
 import json
 import os
+import shlex
 import subprocess
 import time
 import urllib.request
 
-IMAGE = os.environ.get("VLLM_IMAGE", "vllm/vllm-openai:v0.28.0")
+IMAGE = os.environ.get("VLLM_IMAGE", "vllm/vllm-openai:latest")
 PORT = int(os.environ.get("VLLM_PORT", "8080"))
-EXTRA_ARGS = os.environ.get("VLLM_EXTRA_ARGS", "")
+EXTRA_ARGS = shlex.split(os.environ.get("VLLM_EXTRA_ARGS", ""))
 MAX_TOKENS = 256  # mirror ollama's num_predict cap
 
 # tier -> family -> (HF model id, param label, container name)
@@ -61,42 +62,46 @@ PROMPTS = {
 }
 
 
-def wsl(cmd):
-    subprocess.run(["wsl", "-e", "bash", "-lc", cmd], check=True)
+def docker(*args, check=True):
+    return subprocess.run(["docker", *args], check=check, text=True, capture_output=True)
 
 
-def server_up():
+def server_up(model):
     try:
-        urllib.request.urlopen(f"http://localhost:{PORT}/v1/models", timeout=3)
-        return True
+        with urllib.request.urlopen(f"http://localhost:{PORT}/v1/models", timeout=3) as response:
+            return model in {item["id"] for item in json.load(response).get("data", [])}
     except OSError:
         return False
 
 
-def wait_server(timeout=1800):
+def wait_server(model, container, timeout=1800):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if server_up():
+        if server_up(model):
             return
+        state = docker("inspect", "-f", "{{.State.Status}}", container, check=False).stdout.strip()
+        if state in {"exited", "dead"}:
+            logs = docker("logs", "--tail", "60", container, check=False).stdout
+            raise RuntimeError(f"{container} exited:\\n{logs}")
         time.sleep(3)
-    raise TimeoutError(f"vLLM on :{PORT} not ready in {timeout}s (docker logs vllm-smoke)")
+    raise TimeoutError(f"vLLM on :{PORT} did not load {model} within {timeout}s")
 
 
 def start_container(hf, container):
-    token = f"-e HF_TOKEN={os.environ['HF_TOKEN']}" if os.environ.get("HF_TOKEN") else ""
     # VLLM_WSL2_ENABLE_PIN_MEMORY=1: vLLM's V2 runner needs pinned memory for UVA,
     # which is off by default on WSL2 -> otherwise "RuntimeError: UVA is not available"
-    wsl(
-        f"docker rm -f {container} 2>/dev/null; "
-        f"docker run -d --name {container} --gpus all -p {PORT}:8000 "
-        f"--ipc=host --shm-size=8gb -v vllm-hf-cache:/root/.cache/huggingface "
-        f"-e VLLM_WSL2_ENABLE_PIN_MEMORY=1 {token} {IMAGE} "
-        f"--model {hf} --max-model-len 8192 --gpu-memory-utilization 0.9 {EXTRA_ARGS}"
-    )
+    docker("rm", "-f", container, check=False)
+    args = ["run", "-d", "--name", container, "--gpus", "all", "-p", f"{PORT}:8000",
+            "--ipc=host", "--shm-size=8gb", "-v", "vllm-hf-cache:/root/.cache/huggingface",
+            "-e", "VLLM_WSL2_ENABLE_PIN_MEMORY=1"]
+    if token := os.environ.get("HF_TOKEN"):
+        args += ["-e", f"HF_TOKEN={token}"]
+    docker(*args, IMAGE, "--model", hf, "--max-model-len", "8192",
+           "--gpu-memory-utilization", "0.9", "--enforce-eager", *EXTRA_ARGS)
 
 
 def stop_container(container):
-    subprocess.run(["wsl", "-e", "bash", "-lc", f"docker rm -f {container} 2>/dev/null"])
+    docker("rm", "-f", container, check=False)
 
 
 def generate(hf, prompt):
@@ -153,13 +158,14 @@ def main():
             print(f"=== {tier} / {family} ({hf}, {params}) ===")
             print("  starting container...")
             start_container(hf, container)
-            wait_server()
-            print("  warming up (excluded from results)...")
-            generate(hf, "ping")
-            for size, prompt in PROMPTS.items():
-                print(f"  running {size} prompt...")
-                r = generate(hf, prompt)
-                runs.append({
+            try:
+                wait_server(hf, container)
+                print("  warming up (excluded from results)...")
+                generate(hf, "ping")
+                for size, prompt in PROMPTS.items():
+                    print(f"  running {size} prompt...")
+                    r = generate(hf, prompt)
+                    runs.append({
                     "model": hf, "family": family, "tier": tier,
                     "params": params, "size": size,
                     "total_duration_ns": r["total_duration_ns"],
@@ -170,11 +176,12 @@ def main():
                     "eval_duration_ns": r["eval_duration_ns"],
                     "prompt_tps": tps(r["prompt_count"], r["prompt_duration_ns"]),
                     "eval_tps": tps(r["eval_count"], r["eval_duration_ns"]),
-                })
-                print(f"    {r['eval_count']} tok in {r['eval_duration_ns'] / 1e9:.2f}s "
-                      f"-> {runs[-1]['eval_tps']} tok/s")
-            stop_container(container)
-            print(f"  stopped {container}")
+                    })
+                    print(f"    {r['eval_count']} tok in {r['eval_duration_ns'] / 1e9:.2f}s "
+                          f"-> {runs[-1]['eval_tps']} tok/s")
+            finally:
+                stop_container(container)
+                print(f"  stopped {container}")
 
     out = "vllm-benchmark-results.json"
     with open(out, "w", encoding="utf-8") as f:

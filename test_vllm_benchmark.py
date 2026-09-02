@@ -74,6 +74,9 @@ def main():
         assert body["stream"] is True and body["stream_options"] == {"include_usage": True}, body
         assert body["max_tokens"] == 256, body
 
+        ollama = load_module("ollama_benchmark", "ollama-benchmark.py")
+        assert vb.PROMPTS == ollama.PROMPTS
+
         # build a run exactly like main() does, check schema matches ollama's
         run = {
             "model": "test/x", "family": "llama", "tier": "4b", "params": "3B", "size": "small",

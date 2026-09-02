@@ -1,15 +1,15 @@
 # vllm-activation.ps1
-# Set up vLLM on Windows (WSL2 + Docker) and smoke-test it.
+# Set up vLLM with Docker Desktop and smoke-test it.
 #
 # Usage:  .\vllm-activation.ps1 [-Model <hf-id>] [-Image <docker-image>] [-Port <port>] [-Reset] [-DockerCheck]
 #   -Model : HF model for the smoke test (default Qwen/Qwen2.5-0.5B-Instruct: non-gated,
 #            0.5B -> fits a 4GB VRAM GPU)
-#   -Image : vLLM image (default vllm/vllm-openai:v0.28.0)
+#   -Image : vLLM image (default vllm/vllm-openai:latest)
 #   -Port  : host port (default 8080; avoid 8000 which this machine uses for other apps)
 #   -Reset : remove vLLM containers, images, and the vLLM Hugging Face cache before the smoke test
 #   -DockerCheck : start Docker if needed and verify it can run hello-world; does not require a GPU
 #
-# Prereqs: NVIDIA GPU, Windows 10/11 with virtualization enabled.
+# Prereqs: NVIDIA GPU, Docker Desktop using Linux containers.
 #          HF_TOKEN env var for gated models (llama / gemma2 / qwen3-8b).
 #
 # Notes: Docker Desktop is auto-started if its engine is down. Flags are tuned for a
@@ -18,7 +18,7 @@
 # VLLM_WSL2_ENABLE_PIN_MEMORY=1 avoids "RuntimeError: UVA is not available" on WSL2.
 param(
     [string]$Model = 'Qwen/Qwen2.5-0.5B-Instruct',
-    [string]$Image = 'vllm/vllm-openai:v0.28.0',
+    [string]$Image = 'vllm/vllm-openai:latest',
     [int]$Port = 8080,
     [switch]$Reset,
     [switch]$DockerCheck
@@ -28,66 +28,54 @@ $ErrorActionPreference = 'Stop'
 $Container = 'vllm-smoke'
 $TestPrompt = 'What is 2+2?'
 
-function Invoke-Wsl($cmd) {
-    wsl -e bash -lc $cmd  # named Invoke-Wsl so it doesn't shadow wsl.exe (self-recursion -> CallDepthOverflow)
-    if ($LASTEXITCODE -ne 0) { throw "wsl command failed: $cmd" }
+function Invoke-Docker([string[]]$DockerArgs) {
+    & docker @DockerArgs
+    if ($LASTEXITCODE -ne 0) { throw "docker $($DockerArgs -join ' ') failed (exit $LASTEXITCODE)" }
 }
 
-# --- 1. WSL2 ---------------------------------------------------------------
-wsl -e bash -lc 'echo ok' *> $null  # test by exit code, not output
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "WSL2 not ready. Run as Administrator:" -ForegroundColor Yellow
-    Write-Host "  wsl --install -d Ubuntu" -ForegroundColor Yellow
-    Write-Host "then reboot and rerun this script." -ForegroundColor Yellow
-    exit 1
-}
-Write-Host "WSL2 OK" -ForegroundColor Green
-
-# --- 2. Docker Desktop (start it if the engine is down) ----------------------
 function Test-Docker {
-    wsl -e bash -lc 'docker ps' *> $null
-    return $LASTEXITCODE -eq 0
+    try {
+        & docker version --format '{{.Server.Version}}' *> $null
+        return $LASTEXITCODE -eq 0
+    } catch {
+        return $false
+    }
 }
 if (-not (Test-Docker)) {
     $dockerExe = 'C:\Program Files\Docker\Docker\Docker Desktop.exe'
     if (-not (Test-Path $dockerExe)) {
-        Write-Host "Docker Desktop not found. Installing (needs admin + reboot)..." -ForegroundColor Yellow
-        winget install -e --id Docker.DockerDesktop
-        Write-Host "Reboot, start Docker Desktop once, then rerun this script." -ForegroundColor Yellow
-        exit 1
+        throw 'Docker Desktop is not installed. Install it, enable Linux containers, then rerun this script.'
     }
     Write-Host "Starting Docker Desktop..." -ForegroundColor Cyan
     Start-Process $dockerExe
     $deadline = (Get-Date).AddMinutes(3)
     while (-not (Test-Docker) -and (Get-Date) -lt $deadline) { Start-Sleep 5 }
     if (-not (Test-Docker)) {
-        Write-Host "Docker engine not reachable from WSL after 3 min." -ForegroundColor Yellow
-        Write-Host "Check Docker Desktop -> Settings -> Resources -> WSL Integration -> enable your distro, then rerun." -ForegroundColor Yellow
-        exit 1
+        throw 'Docker Desktop did not become ready within 3 minutes.'
     }
 }
 Write-Host "Docker OK" -ForegroundColor Green
 
 if ($Reset) {
     Write-Host "Removing vLLM Docker resources..." -ForegroundColor Cyan
-    Invoke-Wsl "docker ps -aq --filter 'name=^vllm-' | xargs -r docker rm -f; docker images -q 'vllm/*' | xargs -r docker rmi -f; docker volume rm vllm-hf-cache 2>/dev/null || true"
+    $containers = @(& docker ps -aq --filter 'name=^vllm-')
+    if ($containers) { Invoke-Docker (@('rm', '-f') + $containers) }
+    $images = @(& docker images -q 'vllm/*')
+    if ($images) { Invoke-Docker (@('rmi', '-f') + $images) }
+    try { & docker volume rm vllm-hf-cache *> $null } catch {}
     Write-Host "vLLM Docker resources removed" -ForegroundColor Green
 }
 
 if ($DockerCheck) {
     Write-Host "Testing Docker with hello-world..." -ForegroundColor Cyan
-    Invoke-Wsl 'docker run --rm hello-world'
+    Invoke-Docker @('run', '--rm', 'hello-world')
     Write-Host "Docker can initialize and run containers" -ForegroundColor Green
     exit 0
 }
 
-# --- 3. GPU check -----------------------------------------------------------
-Invoke-Wsl 'nvidia-smi' | Out-Null
-Write-Host "GPU OK" -ForegroundColor Green
-
-# --- 4. Image ---------------------------------------------------------------
+# --- Image -----------------------------------------------------------------
 Write-Host "Pulling $Image (first run, may take a while)..." -ForegroundColor Cyan
-Invoke-Wsl "docker pull $Image"
+Invoke-Docker @('pull', $Image)
 
 # --- 5. Smoke test ----------------------------------------------------------
 if (-not $env:HF_TOKEN) {
@@ -95,29 +83,29 @@ if (-not $env:HF_TOKEN) {
     Write-Host "      $Model is public, so this smoke test does not need it." -ForegroundColor Yellow
 }
 Write-Host "Smoke test: $Model on :$Port" -ForegroundColor Cyan
-$tokenArg = if ($env:HF_TOKEN) { "-e HF_TOKEN=$($env:HF_TOKEN)" } else { '' }
-$cmd = "docker rm -f $Container 2>/dev/null; " +
-       "docker run -d --name $Container --gpus all -p ${Port}:8000 " +
-       "--ipc=host --shm-size=8gb -v vllm-hf-cache:/root/.cache/huggingface " +
-       "-e VLLM_WSL2_ENABLE_PIN_MEMORY=1 $tokenArg " +
-       "$Image --model $Model --max-model-len 1024 --gpu-memory-utilization 0.6 --enforce-eager"
-Invoke-Wsl $cmd
+try { & docker rm -f $Container *> $null } catch {}
+$dockerArgs = @('run', '-d', '--name', $Container, '--gpus', 'all', '-p', "${Port}:8000",
+                '--ipc=host', '--shm-size=8gb', '-v', 'vllm-hf-cache:/root/.cache/huggingface',
+                '-e', 'VLLM_WSL2_ENABLE_PIN_MEMORY=1')
+if ($env:HF_TOKEN) { $dockerArgs += @('-e', "HF_TOKEN=$env:HF_TOKEN") }
+$dockerArgs += @($Image, '--model', $Model, '--max-model-len', '1024', '--gpu-memory-utilization', '0.6', '--enforce-eager')
+Invoke-Docker $dockerArgs
 
 $deadline = (Get-Date).AddMinutes(12)
 $ready = $false
 while ((Get-Date) -lt $deadline) {
     # fail fast if the container crashed (OOM / CUDA error) instead of waiting 12 min
-    $state = (wsl -e bash -lc "docker inspect -f '{{.State.Status}}' $Container 2>/dev/null").Trim()
+    $state = (& docker inspect -f '{{.State.Status}}' $Container 2>$null).Trim()
     if ($state -eq 'exited' -or $state -eq 'dead') {
         Write-Host "container exited early ($state). Logs:" -ForegroundColor Red
-        Invoke-Wsl "docker logs --tail 60 $Container"
+        & docker logs --tail 60 $Container
         throw "vLLM container exited: $state"
     }
     try { Invoke-RestMethod "http://localhost:$Port/v1/models" -TimeoutSec 5 | Out-Null; $ready = $true; break } catch { Start-Sleep 3 }
 }
 if (-not $ready) {
     Write-Host "server did not become ready. Logs:" -ForegroundColor Red
-    Invoke-Wsl "docker logs --tail 60 $Container"
+    & docker logs --tail 60 $Container
     throw "vLLM server did not start"
 }
 Write-Host "server ready, testing..." -ForegroundColor Green
@@ -128,5 +116,5 @@ Write-Host "  reply: $($reply.Substring(0, [Math]::Min(120, $reply.Length)))..."
 
 # --- 6. Status --------------------------------------------------------------
 Write-Host "`nvLLM works. Stopping smoke-test container..." -ForegroundColor Green
-Invoke-Wsl "docker rm -f $Container"
+Invoke-Docker @('rm', '-f', $Container)
 Write-Host "Done. Run:  python vllm-benchmark.py" -ForegroundColor Green
