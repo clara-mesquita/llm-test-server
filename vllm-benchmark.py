@@ -155,6 +155,11 @@ def tps(count, ns):
 
 
 def main():
+    if not os.environ.get("HF_TOKEN"):
+        raise SystemExit(
+            "HF_TOKEN is required: accept the Llama and Gemma model licenses on Hugging Face, "
+            "then set $env:HF_TOKEN='hf_...' before running this benchmark."
+        )
     runs = []
     for tier, families in MODELS.items():
         for family, (hf, params, container) in families.items():

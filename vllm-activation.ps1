@@ -1,7 +1,8 @@
 # vllm-activation.ps1
 # Set up vLLM with Docker Desktop and smoke-test it.
 #
-# Usage:  .\vllm-activation.ps1 [-Model <hf-id>] [-Image <docker-image>] [-Port <port>] [-Reset] [-DockerCheck]
+# Usage:  .\vllm-activation.ps1 [-InstallPrerequisites] [-Model <hf-id>] [-Image <docker-image>] [-Port <port>] [-Reset] [-DockerCheck]
+#   -InstallPrerequisites : install WSL2 and Docker Desktop when absent (run PowerShell as Administrator)
 #   -Model : HF model for the smoke test (default Qwen/Qwen2.5-0.5B-Instruct: non-gated,
 #            0.5B -> fits a 4GB VRAM GPU)
 #   -Image : vLLM image (default vllm/vllm-openai:latest)
@@ -21,7 +22,8 @@ param(
     [string]$Image = 'vllm/vllm-openai:latest',
     [int]$Port = 8080,
     [switch]$Reset,
-    [switch]$DockerCheck
+    [switch]$DockerCheck,
+    [switch]$InstallPrerequisites
 )
 
 $ErrorActionPreference = 'Stop'
@@ -46,10 +48,37 @@ function Test-Docker {
         return $false
     }
 }
+
+function Install-Prerequisites {
+    if (-not (Get-Command wsl -ErrorAction SilentlyContinue)) {
+        $principal = [Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+        if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw 'WSL2 is missing. Open PowerShell as Administrator and rerun with -InstallPrerequisites.'
+        }
+        Write-Host 'Installing WSL2 (a reboot may be required)...' -ForegroundColor Cyan
+        & wsl --install --no-distribution
+        if ($LASTEXITCODE -ne 0) { throw 'WSL2 installation failed.' }
+        throw 'WSL2 was installed. Reboot Windows, then rerun this script.'
+    }
+
+    $dockerExe = 'C:\Program Files\Docker\Docker\Docker Desktop.exe'
+    if (-not (Test-Path $dockerExe)) {
+        if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+            throw 'Docker Desktop is missing and winget is unavailable. Install Docker Desktop manually, then rerun.'
+        }
+        Write-Host 'Installing Docker Desktop (a reboot may be required)...' -ForegroundColor Cyan
+        & winget install --exact --id Docker.DockerDesktop --accept-package-agreements --accept-source-agreements
+        if ($LASTEXITCODE -ne 0) { throw 'Docker Desktop installation failed.' }
+        throw 'Docker Desktop was installed. Reboot if prompted, start Docker Desktop once, then rerun this script.'
+    }
+}
+
+if ($InstallPrerequisites) { Install-Prerequisites }
+
 if (-not (Test-Docker)) {
     $dockerExe = 'C:\Program Files\Docker\Docker\Docker Desktop.exe'
     if (-not (Test-Path $dockerExe)) {
-        throw 'Docker Desktop is not installed. Install it, enable Linux containers, then rerun this script.'
+        throw 'Docker Desktop is not installed. Run this script as Administrator with -InstallPrerequisites.'
     }
     Write-Host "Starting Docker Desktop..." -ForegroundColor Cyan
     Start-Process $dockerExe
