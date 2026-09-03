@@ -1,0 +1,51 @@
+# Docker setup for vllm-benchmark.py: a single vLLM OpenAI-compatible server.
+#
+# This is the declarative form of the `docker run` that vllm-benchmark.py issues
+# per model. Pick ONE entry point:
+#   docker compose up -d          -> fixed single model (default: smoke-test model)
+#   python vllm-benchmark.py      -> sweeps all models, starts/stops its own containers
+# Running both at once collides on VLLM_PORT.
+#
+# Configure via env vars or a .env file (see .env.example):
+#   VLLM_MODEL, VLLM_IMAGE, VLLM_PORT, HF_TOKEN
+
+services:
+  vllm:
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:latest}
+    container_name: vllm-server
+    # vLLM flags match vllm-benchmark.py. For a small GPU (4GB), quantized models
+    # won't fit unmodified; add e.g. "--cpu-offload-gb 8" to this list if needed.
+    command:
+      - --model
+      - ${VLLM_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
+      - --max-model-len
+      - "8192"
+      - --gpu-memory-utilization
+      - "0.7"
+      - --enforce-eager
+    environment:
+      # WSL2 needs pinned memory for vLLM's V2 runner (UVA is off by default),
+      # otherwise "RuntimeError: UVA is not available".
+      VLLM_WSL2_ENABLE_PIN_MEMORY: "1"
+      # Gated models (Llama / Gemma) need a read token.
+      HF_TOKEN: ${HF_TOKEN:-}
+    ports:
+      - "${VLLM_PORT:-8080}:8000"
+    volumes:
+      - vllm-hf-cache:/root/.cache/huggingface
+    ipc: host
+    shm_size: "8gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  vllm-hf-cache:
+    # Share the exact volume name vllm-benchmark.py and vllm-activation.ps1 use,
+    # so models download once regardless of entry point.
+    name: vllm-hf-cache
+    external: true

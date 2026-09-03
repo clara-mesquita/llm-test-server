@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
-"""Benchmark same-size models via the vLLM OpenAI-compatible API (WSL2 + Docker).
+"""Benchmark same-size models via the llama.cpp OpenAI-compatible API (Docker).
 
-Mirrors ollama-benchmark.py: same tiers/families/prompts and the same output
-schema, so ollama-results-avg.py aggregates the JSON unchanged.
+Mirrors vllm-benchmark.py / ollama-benchmark.py: same tiers/families/prompts
+and the same output schema, so ollama-results-avg.py aggregates unchanged.
 
-Timing note: vLLM's OpenAI API does not expose per-request prompt/eval
-durations, so they are approximated from the stream — prompt_duration ~
-time-to-first-token (TTFT), eval_duration ~ total - TTFT.
+Models are GGUF (Q4_K_M) pulled from Hugging Face via llama.cpp's -hf flag.
+Unlike vLLM (bfloat16), Q4_K_M GGUF fits a 4GB GPU for the 4b/8b tiers; bigger
+tiers spill layers to CPU automatically (-ngl 999 offloads what fits).
 
-Run:  python vllm-benchmark.py
-Prereqs: Docker Desktop + WSL2 up (vllm-activation.ps1); HF_TOKEN for gated models.
-Env:   VLLM_IMAGE       (default vllm/vllm-openai:latest)
-       VLLM_PORT        host port (default 8080; models run one at a time)
-       VLLM_EXTRA_ARGS  extra vLLM flags, e.g. "--quantization awq --cpu-offload-gb 8"
+Timing note: like vllm-benchmark.py, prompt_duration ~ time-to-first-token and
+eval_duration ~ total - TTFT. llama.cpp also reports real timings
+(timings.prompt_ms / predicted_ms) but the TTFT method keeps all three
+benchmarks measured the same way.
+
+Run:  python llama-benchmark.py
+Prereqs: Docker up (see docker-compose.yml); HF_TOKEN for gated Llama models.
+Env:   LLAMA_IMAGE        (default ghcr.io/ggml-org/llama.cpp:server-cuda)
+       LLAMA_PORT         host port (default 8081; vLLM uses 8080)
+       LLAMA_EXTRA_ARGS   extra llama.cpp flags, e.g. "--parallel 4"
+       LLAMA_N_GPU_LAYERS GPU layers to offload (default 999 = all that fit)
 """
 
 import json
@@ -22,28 +28,29 @@ import subprocess
 import time
 import urllib.request
 
-IMAGE = os.environ.get("VLLM_IMAGE", "vllm/vllm-openai:latest")
-PORT = int(os.environ.get("VLLM_PORT", "8080"))
-EXTRA_ARGS = shlex.split(os.environ.get("VLLM_EXTRA_ARGS", ""))
+IMAGE = os.environ.get("LLAMA_IMAGE", "ghcr.io/ggml-org/llama.cpp:server-cuda")
+PORT = int(os.environ.get("LLAMA_PORT", "8081"))
+EXTRA_ARGS = shlex.split(os.environ.get("LLAMA_EXTRA_ARGS", ""))
+N_GPU_LAYERS = os.environ.get("LLAMA_N_GPU_LAYERS", "999")
 MAX_TOKENS = 256  # mirror ollama's num_predict cap
 
-# tier -> family -> (HF model id, param label, container name)
-# models run one at a time on PORT, so no per-model ports needed
+# tier -> family -> (HF GGUF repo:quant, param label, container name)
+# Q4_K_M = the standard 4-bit quant. Confirm each repo ships Q4_K_M on first run.
 MODELS = {
     "4b": {
-        "llama": ("meta-llama/Llama-3.2-3B-Instruct", "3B",   "vllm-llama-3b"),
-        "gemma": ("google/gemma-4-e4b-it",            "4.5B", "vllm-gemma-4b"),
-        "qwen":  ("Qwen/Qwen3-4B",                    "4B",   "vllm-qwen-4b"),
+        "llama": ("unsloth/Llama-3.2-3B-Instruct-GGUF:Q4_K_M", "3B",  "llamacpp-llama-3b"),
+        "gemma": ("ggml-org/gemma-3-4b-it-GGUF:Q4_K_M",         "4B",  "llamacpp-gemma-4b"),
+        "qwen":  ("Qwen/Qwen3-4B-GGUF:Q4_K_M",                  "4B",  "llamacpp-qwen-4b"),
     },
     "8b": {
-        "llama": ("meta-llama/Llama-3.1-8B-Instruct", "8B",   "vllm-llama-8b"),
-        "gemma": ("google/gemma-2-9b-it",             "9B",   "vllm-gemma-9b"),
-        "qwen":  ("Qwen/Qwen3-8B-Instruct",           "8B",   "vllm-qwen-8b"),
+        "llama": ("unsloth/Llama-3.1-8B-Instruct-GGUF:Q4_K_M", "8B",  "llamacpp-llama-8b"),
+        "gemma": ("ggml-org/gemma-2-9b-it-GGUF:Q4_K_M",         "9B",  "llamacpp-gemma-9b"),
+        "qwen":  ("Qwen/Qwen3-8B-GGUF:Q4_K_M",                  "8B",  "llamacpp-qwen-8b"),
     },
     "16b": {
-        "llama": ("meta-llama/Llama-4-Scout-17B-16E-Instruct", "17B", "vllm-llama-17b"),
-        "gemma": ("google/gemma-4-12b-it",            "12B",  "vllm-gemma-12b"),
-        "qwen":  ("Qwen/Qwen3-14B",                   "14B",  "vllm-qwen-14b"),
+        "llama": ("unsloth/Llama-4-Scout-17B-16E-Instruct-GGUF:Q4_K_M", "17B", "llamacpp-llama-17b"),
+        "gemma": ("ggml-org/gemma-3-12b-it-GGUF:Q4_K_M",                "12B", "llamacpp-gemma-12b"),
+        "qwen":  ("Qwen/Qwen3-14B-GGUF:Q4_K_M",                         "14B", "llamacpp-qwen-14b"),
     },
 }
 
@@ -85,22 +92,21 @@ def wait_server(model, container, timeout=1800):
         state = docker("inspect", "-f", "{{.State.Status}}", container, check=False).stdout.strip()
         if state in {"exited", "dead"}:
             logs = docker("logs", "--tail", "60", container, check=False).stdout
-            raise RuntimeError(f"{container} exited:\\n{logs}")
+            raise RuntimeError(f"{container} exited:\n{logs}")
         time.sleep(3)
-    raise TimeoutError(f"vLLM on :{PORT} did not load {model} within {timeout}s")
+    raise TimeoutError(f"llama.cpp on :{PORT} did not load {model} within {timeout}s")
 
 
 def start_container(hf, container):
-    # VLLM_WSL2_ENABLE_PIN_MEMORY=1: vLLM's V2 runner needs pinned memory for UVA,
-    # which is off by default on WSL2 -> otherwise "RuntimeError: UVA is not available"
     docker("rm", "-f", container, check=False)
+    # -ngl 999: offload as many layers as fit in VRAM; llama.cpp spills the rest
+    # to CPU instead of OOMing, so the 8b/16b tiers still run on a 4GB GPU.
     args = ["run", "-d", "--name", container, "--gpus", "all", "-p", f"{PORT}:8000",
-            "--ipc=host", "--shm-size=8gb", "-v", "vllm-hf-cache:/root/.cache/huggingface",
-            "-e", "VLLM_WSL2_ENABLE_PIN_MEMORY=1"]
+            "-v", "llama-hf-cache:/root/.cache/huggingface"]
     if token := os.environ.get("HF_TOKEN"):
         args += ["-e", f"HF_TOKEN={token}"]
-    docker(*args, IMAGE, "--model", hf, "--max-model-len", "8192",
-           "--gpu-memory-utilization", "0.7", "--enforce-eager", *EXTRA_ARGS)
+    docker(*args, IMAGE, "-hf", hf, "--host", "0.0.0.0", "--port", "8000",
+           "-ngl", N_GPU_LAYERS, "-c", "8192", *EXTRA_ARGS)
 
 
 def stop_container(container):
@@ -156,10 +162,7 @@ def tps(count, ns):
 
 def main():
     if not os.environ.get("HF_TOKEN"):
-        raise SystemExit(
-            "HF_TOKEN is required: accept the Llama and Gemma model licenses on Hugging Face, "
-            "then set $env:HF_TOKEN='hf_...' before running this benchmark."
-        )
+        print("NOTE: HF_TOKEN not set - gated Llama models will fail (401); Qwen/Gemma are public.")
     runs = []
     for tier, families in MODELS.items():
         for family, (hf, params, container) in families.items():
@@ -174,16 +177,16 @@ def main():
                     print(f"  running {size} prompt...")
                     r = generate(hf, prompt)
                     runs.append({
-                    "model": hf, "family": family, "tier": tier,
-                    "params": params, "size": size,
-                    "total_duration_ns": r["total_duration_ns"],
-                    "load_duration_ns": 0,  # model loaded at server start
-                    "prompt_eval_count": r["prompt_count"],
-                    "prompt_eval_duration_ns": r["prompt_duration_ns"],
-                    "eval_count": r["eval_count"],
-                    "eval_duration_ns": r["eval_duration_ns"],
-                    "prompt_tps": tps(r["prompt_count"], r["prompt_duration_ns"]),
-                    "eval_tps": tps(r["eval_count"], r["eval_duration_ns"]),
+                        "model": hf, "family": family, "tier": tier,
+                        "params": params, "size": size,
+                        "total_duration_ns": r["total_duration_ns"],
+                        "load_duration_ns": 0,  # model loaded at server start
+                        "prompt_eval_count": r["prompt_count"],
+                        "prompt_eval_duration_ns": r["prompt_duration_ns"],
+                        "eval_count": r["eval_count"],
+                        "eval_duration_ns": r["eval_duration_ns"],
+                        "prompt_tps": tps(r["prompt_count"], r["prompt_duration_ns"]),
+                        "eval_tps": tps(r["eval_count"], r["eval_duration_ns"]),
                     })
                     print(f"    {r['eval_count']} tok in {r['eval_duration_ns'] / 1e9:.2f}s "
                           f"-> {runs[-1]['eval_tps']} tok/s")
@@ -191,7 +194,7 @@ def main():
                 stop_container(container)
                 print(f"  stopped {container}")
 
-    out = "vllm-benchmark-results.json"
+    out = "llama-benchmark-results.json"
     with open(out, "w", encoding="utf-8") as f:
         json.dump(runs, f, indent=2)
 

@@ -1,7 +1,10 @@
 # run artifacts
 logs/
 *.log
-ollama-benchmark-results.json
+*-benchmark-results.json
+
+# secrets / local compose config
+.env
 
 # python
 __pycache__/
